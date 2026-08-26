@@ -1,0 +1,805 @@
+"""PWF Auth desktop client built with Tkinter.
+
+The UI deliberately keeps the API response open-ended: every leaf returned by the
+server is displayed in the information table and the complete JSON remains available.
+"""
+
+from __future__ import annotations
+
+import json
+import os
+import queue
+import re
+import threading
+from datetime import datetime
+import tkinter as tk
+from tkinter import messagebox, ttk
+
+from pwfauth import PwfClient, PwfCryptoError, PwfError, PwfHttpError
+
+
+# Demo configuration: replace this placeholder with the 64-character secret from
+# your PWF Auth dashboard. For production applications, use an environment variable
+# instead of embedding the secret in source code.
+APP_SECRET = "YOUR_64_CHARACTER_APP_SECRET"
+
+COLORS = {
+    "page": "#0b1220",
+    "card": "#172133",
+    "entry": "#0f172a",
+    "blue": "#3b82f6",
+    "blue_light": "#60a5fa",
+    "white": "#ffffff",
+    "text": "#0f172a",
+    "muted": "#64748b",
+    "muted_dark": "#94a3b8",
+    "border": "#cbd5e1",
+    "surface": "#f1f5f9",
+    "success": "#16a34a",
+    "warning": "#d97706",
+    "error": "#f87171",
+    "table_header": "#1e293b",
+    "selection": "#dbeafe",
+}
+
+FIELD_NAMES = {
+    "success": "Request successful",
+    "message": "Server message",
+    "error_code": "Error code",
+    "session_id": "Session ID",
+    "heartbeat_interval": "Heartbeat interval",
+    "user.license_key": "License key",
+    "user.key_type": "Key type",
+    "user.duration": "Key duration",
+    "user.hwid": "Device HWID",
+    "user.activated_at": "Activation date",
+    "user.expires_at": "Expiration date",
+    "user.days_remaining": "Days remaining",
+    "user.status": "Key status",
+    "app.name": "Application name",
+    "app.version": "Application version",
+    "app.message": "Application message",
+    "texts": "Remote texts",
+    "features": "Key features",
+    "slides": "Announcement slides",
+}
+
+
+def load_app_secret() -> str | None:
+    """Return the in-code demo secret, with environment variables as an override."""
+    for variable in ("PWFAUTH_SECRET", "PWFAUTH_APP_SECRET"):
+        value = os.environ.get(variable, "").strip()
+        if value:
+            return value
+
+    value = APP_SECRET.strip()
+    if not value or value == "YOUR_64_CHARACTER_APP_SECRET":
+        return None
+    return value
+
+
+def parse_server_date(value: object) -> datetime | None:
+    if not isinstance(value, str) or not value.strip():
+        return None
+    text = value.strip().replace(" ", "T")
+    if text.endswith("Z"):
+        text = text[:-1] + "+00:00"
+    try:
+        return datetime.fromisoformat(text)
+    except ValueError:
+        return None
+
+
+def normalize_array_path(path: str) -> str:
+    return re.sub(r"\[\d+\]", "", path)
+
+
+class PwfAuthApp(tk.Tk):
+    def __init__(self) -> None:
+        super().__init__()
+        self.title("PWF Auth - Sign In")
+        self.geometry("1084x721")
+        self.minsize(900, 650)
+        self.configure(bg=COLORS["page"])
+        self.protocol("WM_DELETE_WINDOW", self._request_close)
+
+        self._events: queue.Queue[tuple[str, object]] = queue.Queue()
+        self._client: PwfClient | None = None
+        self._logging_in = False
+        self._closing = False
+        self._copy_reset_after: str | None = None
+
+        self._configure_styles()
+        self._build_login_page()
+        self._build_dashboard()
+        self._show_login()
+        self.bind("<Return>", self._on_enter)
+        self.after(100, self._poll_events)
+
+    # ------------------------------------------------------------------ UI
+
+    def _configure_styles(self) -> None:
+        style = ttk.Style(self)
+        try:
+            style.theme_use("clam")
+        except tk.TclError:
+            pass
+
+        style.configure(
+            "Pwf.TNotebook",
+            background=COLORS["surface"],
+            borderwidth=0,
+            tabmargins=(0, 0, 0, 0),
+        )
+        style.configure(
+            "Pwf.TNotebook.Tab",
+            background="#e2e8f0",
+            foreground=COLORS["text"],
+            font=("Segoe UI", 10),
+            padding=(15, 8),
+        )
+        style.map(
+            "Pwf.TNotebook.Tab",
+            background=[("selected", COLORS["white"])],
+            foreground=[("selected", COLORS["text"])],
+        )
+        style.configure(
+            "Pwf.Treeview",
+            background=COLORS["white"],
+            fieldbackground=COLORS["white"],
+            foreground=COLORS["text"],
+            rowheight=32,
+            font=("Segoe UI", 9),
+            borderwidth=0,
+        )
+        style.configure(
+            "Pwf.Treeview.Heading",
+            background=COLORS["table_header"],
+            foreground=COLORS["white"],
+            font=("Segoe UI", 10, "bold"),
+            padding=(8, 8),
+            relief="flat",
+        )
+        style.map(
+            "Pwf.Treeview",
+            background=[("selected", COLORS["selection"])],
+            foreground=[("selected", COLORS["text"])],
+        )
+        style.map(
+            "Pwf.Treeview.Heading",
+            background=[("active", COLORS["table_header"])],
+        )
+
+    def _build_login_page(self) -> None:
+        self.login_page = tk.Frame(self, bg=COLORS["page"])
+        card = tk.Frame(
+            self.login_page,
+            bg=COLORS["card"],
+            width=500,
+            height=465,
+            highlightthickness=0,
+        )
+        card.place(relx=0.5, rely=0.5, anchor="center")
+        card.pack_propagate(False)
+
+        tk.Frame(card, bg=COLORS["blue"], height=5).pack(fill="x")
+        tk.Label(
+            card,
+            text="◆  PWF AUTH",
+            bg=COLORS["card"],
+            fg=COLORS["blue_light"],
+            font=("Segoe UI", 16, "bold"),
+        ).place(x=42, y=45, width=416, height=44)
+        tk.Label(
+            card,
+            text="Welcome Back",
+            bg=COLORS["card"],
+            fg=COLORS["white"],
+            font=("Segoe UI", 18, "bold"),
+        ).place(x=42, y=103, width=416, height=42)
+        tk.Label(
+            card,
+            text="Enter your key to connect to the license server\nand view your complete subscription details",
+            bg=COLORS["card"],
+            fg=COLORS["muted_dark"],
+            font=("Segoe UI", 9),
+            justify="center",
+        ).place(x=42, y=151, width=416, height=42)
+        tk.Label(
+            card,
+            text="License key",
+            bg=COLORS["card"],
+            fg="#cbd5e1",
+            font=("Segoe UI", 9),
+            anchor="w",
+        ).place(x=42, y=207, width=416, height=23)
+
+        self.license_key_var = tk.StringVar()
+        self.license_entry = tk.Entry(
+            card,
+            textvariable=self.license_key_var,
+            bg=COLORS["entry"],
+            fg=COLORS["white"],
+            insertbackground=COLORS["white"],
+            selectbackground=COLORS["blue"],
+            relief="flat",
+            highlightthickness=1,
+            highlightbackground="#64748b",
+            highlightcolor=COLORS["blue_light"],
+            justify="center",
+            font=("Consolas", 13),
+        )
+        self.license_entry.place(x=42, y=239, width=416, height=30)
+
+        self.login_button = tk.Button(
+            card,
+            text="Sign In",
+            command=self._begin_login,
+            bg=COLORS["blue"],
+            activebackground="#2563eb",
+            fg=COLORS["white"],
+            activeforeground=COLORS["white"],
+            disabledforeground="#dbeafe",
+            relief="flat",
+            bd=0,
+            cursor="hand2",
+            font=("Segoe UI", 11, "bold"),
+        )
+        self.login_button.place(x=42, y=289, width=416, height=46)
+
+        self.login_progress = ttk.Progressbar(card, mode="indeterminate")
+        self.login_status = tk.Label(
+            card,
+            text="",
+            bg=COLORS["card"],
+            fg=COLORS["error"],
+            font=("Segoe UI", 9),
+            justify="center",
+            wraplength=410,
+        )
+        self.login_status.place(x=42, y=358, width=416, height=44)
+        tk.Label(
+            card,
+            text="Encrypted connection  •  Key bound to this device",
+            bg=COLORS["card"],
+            fg="#8b97ad",
+            font=("Segoe UI", 9),
+        ).place(x=42, y=412, width=416, height=22)
+
+    def _build_dashboard(self) -> None:
+        self.dashboard = tk.Frame(self, bg=COLORS["surface"], padx=22)
+
+        header = tk.Frame(self.dashboard, bg=COLORS["surface"], height=96)
+        header.pack(fill="x")
+        header.pack_propagate(False)
+        left_header = tk.Frame(header, bg=COLORS["surface"])
+        left_header.pack(side="left", fill="both", expand=True)
+        self.dashboard_title = tk.Label(
+            left_header,
+            text="License Information",
+            bg=COLORS["surface"],
+            fg=COLORS["text"],
+            font=("Segoe UI", 20, "bold"),
+            anchor="w",
+        )
+        self.dashboard_title.pack(fill="x", pady=(13, 0))
+        self.dashboard_subtitle = tk.Label(
+            left_header,
+            text="",
+            bg=COLORS["surface"],
+            fg=COLORS["muted"],
+            font=("Segoe UI", 9),
+            anchor="w",
+        )
+        self.dashboard_subtitle.pack(fill="x")
+
+        right_header = tk.Frame(header, bg=COLORS["surface"])
+        right_header.pack(side="right", padx=(10, 0), pady=28)
+        self.session_status = tk.Label(
+            right_header,
+            text="● Session active and protected",
+            bg=COLORS["surface"],
+            fg=COLORS["success"],
+            font=("Segoe UI", 9, "bold"),
+        )
+        self.session_status.pack(side="left", padx=(0, 15))
+        self.logout_button = tk.Button(
+            right_header,
+            text="Sign Out",
+            command=self._begin_logout,
+            bg=COLORS["white"],
+            activebackground="#e2e8f0",
+            fg="#334155",
+            relief="solid",
+            bd=1,
+            cursor="hand2",
+            font=("Segoe UI", 9),
+            width=14,
+        )
+        self.logout_button.pack(side="right", ipady=8)
+
+        summary = tk.Frame(self.dashboard, bg=COLORS["surface"], height=122)
+        summary.pack(fill="x", pady=(8, 8))
+        summary.pack_propagate(False)
+        for column in range(4):
+            summary.grid_columnconfigure(column, weight=1, uniform="summary")
+        summary.grid_rowconfigure(0, weight=1)
+
+        self.status_value = self._make_summary_card(summary, 0, "KEY STATUS", COLORS["success"])
+        self.type_value = self._make_summary_card(summary, 1, "SUBSCRIPTION TYPE", COLORS["text"])
+        self.expiry_value = self._make_summary_card(summary, 2, "EXPIRATION DATE", COLORS["text"], 13)
+        self.remaining_value = self._make_summary_card(summary, 3, "TIME REMAINING", "#2563eb")
+
+        notebook = ttk.Notebook(self.dashboard, style="Pwf.TNotebook")
+        notebook.pack(fill="both", expand=True)
+        details_tab = tk.Frame(notebook, bg=COLORS["white"], padx=8, pady=8)
+        json_tab = tk.Frame(notebook, bg=COLORS["white"], padx=8, pady=8)
+        notebook.add(details_tab, text="All Information")
+        notebook.add(json_tab, text="Complete JSON")
+
+        columns = ("field", "path", "value")
+        self.details_tree = ttk.Treeview(
+            details_tab,
+            columns=columns,
+            show="headings",
+            style="Pwf.Treeview",
+            selectmode="browse",
+        )
+        self.details_tree.heading("field", text="Field", anchor="w")
+        self.details_tree.heading("path", text="API Path", anchor="w")
+        self.details_tree.heading("value", text="Value", anchor="w")
+        self.details_tree.column("field", width=220, minwidth=140, anchor="w", stretch=False)
+        self.details_tree.column("path", width=230, minwidth=150, anchor="w", stretch=False)
+        self.details_tree.column("value", width=520, minwidth=220, anchor="w", stretch=True)
+        tree_y = ttk.Scrollbar(details_tab, orient="vertical", command=self.details_tree.yview)
+        tree_x = ttk.Scrollbar(details_tab, orient="horizontal", command=self.details_tree.xview)
+        self.details_tree.configure(yscrollcommand=tree_y.set, xscrollcommand=tree_x.set)
+        self.details_tree.grid(row=0, column=0, sticky="nsew")
+        tree_y.grid(row=0, column=1, sticky="ns")
+        tree_x.grid(row=1, column=0, sticky="ew")
+        details_tab.grid_rowconfigure(0, weight=1)
+        details_tab.grid_columnconfigure(0, weight=1)
+        self.details_tree.tag_configure("even", background=COLORS["white"])
+        self.details_tree.tag_configure("odd", background="#f8fafc")
+
+        json_toolbar = tk.Frame(json_tab, bg=COLORS["white"], height=48)
+        json_toolbar.pack(fill="x")
+        json_toolbar.pack_propagate(False)
+        tk.Label(
+            json_toolbar,
+            text="The complete original response returned by the server",
+            bg=COLORS["white"],
+            fg=COLORS["muted"],
+            font=("Segoe UI", 9),
+            anchor="w",
+        ).pack(side="left", fill="both", expand=True)
+        self.copy_button = tk.Button(
+            json_toolbar,
+            text="Copy JSON",
+            command=self._copy_json,
+            bg="#334155",
+            activebackground="#1e293b",
+            fg=COLORS["white"],
+            activeforeground=COLORS["white"],
+            relief="flat",
+            bd=0,
+            cursor="hand2",
+            font=("Segoe UI", 9),
+            width=14,
+        )
+        self.copy_button.pack(side="right", fill="y")
+
+        json_body = tk.Frame(json_tab, bg=COLORS["entry"])
+        json_body.pack(fill="both", expand=True)
+        json_y = ttk.Scrollbar(json_body, orient="vertical")
+        json_x = ttk.Scrollbar(json_body, orient="horizontal")
+        self.raw_json = tk.Text(
+            json_body,
+            bg=COLORS["entry"],
+            fg="#e2e8f0",
+            insertbackground=COLORS["white"],
+            selectbackground=COLORS["blue"],
+            relief="flat",
+            bd=0,
+            wrap="none",
+            font=("Consolas", 10),
+            padx=12,
+            pady=10,
+            state="disabled",
+            yscrollcommand=json_y.set,
+            xscrollcommand=json_x.set,
+        )
+        json_y.configure(command=self.raw_json.yview)
+        json_x.configure(command=self.raw_json.xview)
+        self.raw_json.grid(row=0, column=0, sticky="nsew")
+        json_y.grid(row=0, column=1, sticky="ns")
+        json_x.grid(row=1, column=0, sticky="ew")
+        json_body.grid_rowconfigure(0, weight=1)
+        json_body.grid_columnconfigure(0, weight=1)
+
+        self.session_info = tk.Label(
+            self.dashboard,
+            text="",
+            bg=COLORS["surface"],
+            fg=COLORS["muted"],
+            font=("Segoe UI", 8),
+            anchor="w",
+        )
+        self.session_info.pack(fill="x", ipady=10)
+
+    def _make_summary_card(
+        self,
+        parent: tk.Frame,
+        column: int,
+        caption: str,
+        value_color: str,
+        value_size: int = 16,
+    ) -> tk.Label:
+        card = tk.Frame(parent, bg=COLORS["white"], padx=18, pady=12)
+        card.grid(row=0, column=column, sticky="nsew", padx=5)
+        tk.Label(
+            card,
+            text=caption,
+            bg=COLORS["white"],
+            fg=COLORS["muted"],
+            font=("Segoe UI", 8),
+            anchor="w",
+        ).pack(fill="x")
+        value = tk.Label(
+            card,
+            text="—",
+            bg=COLORS["white"],
+            fg=value_color,
+            font=("Segoe UI", value_size, "bold"),
+            anchor="w",
+        )
+        value.pack(fill="both", expand=True)
+        return value
+
+    # ----------------------------------------------------------- login/logout
+
+    def _on_enter(self, _event: tk.Event) -> None:
+        if self.login_page.winfo_ismapped() and not self._logging_in:
+            self._begin_login()
+
+    def _begin_login(self) -> None:
+        if self._logging_in:
+            return
+        license_key = self.license_key_var.get().strip().upper()
+        if not license_key:
+            self._set_login_message("Enter your license key first.", error=True)
+            self.license_entry.focus_set()
+            return
+
+        app_secret = load_app_secret()
+        if not app_secret:
+            self._set_login_message(
+                "The application secret is not configured. Replace APP_SECRET at the top "
+                "of app.py with your 64-character application secret.",
+                error=True,
+            )
+            return
+
+        self._set_login_busy(True)
+        self._set_login_message("Verifying the key and connecting to the server...", error=False)
+        threading.Thread(
+            target=self._login_worker,
+            args=(app_secret, license_key),
+            daemon=True,
+            name="pwfauth-login",
+        ).start()
+
+    def _login_worker(self, app_secret: str, license_key: str) -> None:
+        client: PwfClient | None = None
+        try:
+            client = PwfClient(app_secret)
+            client.on_session_ended = self._session_ended_callback
+            response = client.login(license_key)
+            if not response.success:
+                message = response.message or "Sign-in failed."
+                if response.error_code:
+                    message += f" ({response.error_code})"
+                self._events.put(("login_failed", message))
+                return
+
+            interval = response.data.get("heartbeat_interval")
+            if isinstance(interval, int) and interval > 0:
+                client.heartbeat_seconds = interval
+            client.start_heartbeat()
+            self._events.put(("login_succeeded", (client, response)))
+            client = None
+        except PwfCryptoError as exc:
+            self._events.put((
+                "login_failed",
+                "The encrypted response could not be verified. Check the application secret "
+                f"and the device clock.\n{exc}",
+            ))
+        except PwfHttpError as exc:
+            status = f" (HTTP {exc.status})" if exc.status else ""
+            self._events.put(("login_failed", f"Could not reach the license server{status}.\n{exc}"))
+        except PwfError as exc:
+            self._events.put(("login_failed", str(exc)))
+        except Exception as exc:  # UI boundary: never let a worker silently die.
+            self._events.put(("login_failed", f"An unexpected error occurred: {exc}"))
+        finally:
+            if client is not None:
+                client.stop_heartbeat()
+
+    def _begin_logout(self) -> None:
+        client = self._client
+        if client is None:
+            self._show_login()
+            return
+        self.logout_button.configure(state="disabled")
+        self.session_status.configure(text="Closing session...", fg=COLORS["warning"])
+        threading.Thread(
+            target=self._logout_worker,
+            args=(client, False),
+            daemon=True,
+            name="pwfauth-logout",
+        ).start()
+
+    def _logout_worker(self, client: PwfClient, close_after: bool) -> None:
+        warning = ""
+        try:
+            if client.is_signed_in:
+                client.logout()
+            else:
+                client.stop_heartbeat()
+        except Exception as exc:
+            client.stop_heartbeat()
+            warning = f"Signed out locally, but the server could not be notified: {exc}"
+        self._events.put(("logout_finished", (client, close_after, warning)))
+
+    def _session_ended_callback(self, error_code: str | None, message: str | None) -> None:
+        # Called by the SDK heartbeat thread. Tk must only be touched on its main thread.
+        self._events.put((
+            "session_ended",
+            (error_code or "UNKNOWN", message or "The session is no longer valid."),
+        ))
+
+    # ---------------------------------------------------------- event handling
+
+    def _poll_events(self) -> None:
+        try:
+            while True:
+                event, payload = self._events.get_nowait()
+                if event == "login_succeeded":
+                    client, response = payload  # type: ignore[misc]
+                    self._client = client
+                    self._populate_dashboard(response)
+                    self._set_login_busy(False)
+                    self._show_dashboard()
+                elif event == "login_failed":
+                    self._set_login_busy(False)
+                    self._set_login_message(str(payload), error=True)
+                elif event == "session_ended":
+                    error_code, message = payload  # type: ignore[misc]
+                    if self._client is not None:
+                        self._client.stop_heartbeat()
+                    self._client = None
+                    self._show_login()
+                    self._set_login_message(
+                        f"Session ended: {message} ({error_code})",
+                        error=True,
+                    )
+                elif event == "logout_finished":
+                    client, close_after, warning = payload  # type: ignore[misc]
+                    if self._client is client:
+                        self._client = None
+                    if close_after:
+                        self.destroy()
+                        return
+                    self.logout_button.configure(state="normal")
+                    self._show_login()
+                    self._set_login_message(warning, error=bool(warning))
+        except queue.Empty:
+            pass
+
+        if self.winfo_exists():
+            self.after(100, self._poll_events)
+
+    # ---------------------------------------------------------- data display
+
+    def _populate_dashboard(self, response: object) -> None:
+        data = response.data  # PwfResponse; kept untyped to support future SDK growth.
+        license_info = response.license
+        app = data.get("app") if isinstance(data.get("app"), dict) else {}
+
+        app_name = app.get("name") if isinstance(app.get("name"), str) else ""
+        app_version = app.get("version") if isinstance(app.get("version"), str) else ""
+        app_message = app.get("message") if isinstance(app.get("message"), str) else ""
+        license_key = license_info.license_key if license_info else ""
+
+        self.dashboard_title.configure(
+            text=f"{app_name} — License Information" if app_name else "License Information"
+        )
+        subtitle_parts = [part for part in (
+            license_key,
+            f"Version {app_version}" if app_version else "",
+            app_message,
+        ) if part]
+        self.dashboard_subtitle.configure(text="  •  ".join(subtitle_parts))
+
+        status = license_info.status if license_info else None
+        self.status_value.configure(text=self._display_status(status))
+        self.type_value.configure(text=self._display_key_type(license_info))
+        self.expiry_value.configure(text=self._display_expiry(license_info))
+        self.remaining_value.configure(text=self._display_remaining(license_info))
+        self.session_status.configure(
+            text="● Session active and protected",
+            fg=COLORS["success"],
+        )
+
+        client = self._client
+        self.session_info.configure(text=(
+            f"Device ID: {client.hardware_id}   •   Heartbeat every {client.heartbeat_seconds} seconds"
+            f"   •   Session ID: {client.session_id}"
+        ) if client else "")
+
+        for item in self.details_tree.get_children():
+            self.details_tree.delete(item)
+        rows: list[tuple[str, object]] = []
+        self._flatten_json(data, "", rows)
+        for index, (path, value) in enumerate(rows):
+            normalized = normalize_array_path(path)
+            display_name = FIELD_NAMES.get(path) or FIELD_NAMES.get(normalized)
+            if not display_name:
+                display_name = normalized.rsplit(".", 1)[-1] if normalized else "Value"
+            self.details_tree.insert(
+                "",
+                "end",
+                values=(display_name, path, self._format_json_value(path, value)),
+                tags=("even" if index % 2 == 0 else "odd",),
+            )
+
+        formatted = json.dumps(data, indent=2, ensure_ascii=False)
+        self.raw_json.configure(state="normal")
+        self.raw_json.delete("1.0", "end")
+        self.raw_json.insert("1.0", formatted)
+        self.raw_json.configure(state="disabled")
+
+    def _flatten_json(
+        self,
+        value: object,
+        path: str,
+        rows: list[tuple[str, object]],
+    ) -> None:
+        if isinstance(value, dict):
+            if not value and path:
+                rows.append((path, {}))
+            for key, child in value.items():
+                child_path = f"{path}.{key}" if path else str(key)
+                self._flatten_json(child, child_path, rows)
+            return
+        if isinstance(value, list):
+            if not value:
+                rows.append((path, []))
+            for index, child in enumerate(value):
+                self._flatten_json(child, f"{path}[{index}]", rows)
+            return
+        rows.append((path, value))
+
+    def _format_json_value(self, path: str, value: object) -> str:
+        if value is None:
+            if path.endswith("expires_at") or path.endswith("days_remaining"):
+                return "Lifetime (null)"
+            return "null"
+        if isinstance(value, bool):
+            return "true (Yes)" if value else "false (No)"
+        if isinstance(value, (dict, list)):
+            return json.dumps(value, ensure_ascii=False)
+        if isinstance(value, str) and (path.endswith("_at") or path.endswith("_date")):
+            parsed = parse_server_date(value)
+            if parsed is not None:
+                local = parsed.astimezone()
+                # Keep the server text reachable while presenting the local instant clearly.
+                return f"{local:%Y/%m/%d %H:%M:%S} Local  |  {value}"
+        return str(value)
+
+    @staticmethod
+    def _display_status(status: str | None) -> str:
+        return {
+            "active": "Active",
+            "paused": "Paused",
+            "expired": "Expired",
+            "banned": "Banned",
+        }.get((status or "").lower(), status or "Active")
+
+    @staticmethod
+    def _display_key_type(license_info: object) -> str:
+        if license_info is None:
+            return "Not specified"
+        if license_info.is_lifetime:
+            return "Lifetime"
+        key_type = license_info.key_type or "Not specified"
+        return f"{license_info.duration} {key_type}" if license_info.duration is not None else key_type
+
+    @staticmethod
+    def _display_expiry(license_info: object) -> str:
+        if license_info is None or license_info.is_lifetime:
+            return "Never expires"
+        return license_info.expires_at.astimezone().strftime("%Y/%m/%d  %H:%M")
+
+    @staticmethod
+    def _display_remaining(license_info: object) -> str:
+        if license_info is None or license_info.is_lifetime:
+            return "Lifetime"
+        days = license_info.days_remaining
+        return f"{days} days" if days is not None else "Not specified"
+
+    # ------------------------------------------------------------ view state
+
+    def _show_login(self) -> None:
+        self.dashboard.pack_forget()
+        self.login_page.pack(fill="both", expand=True)
+        self.title("PWF Auth - Sign In")
+        self.license_entry.focus_set()
+
+    def _show_dashboard(self) -> None:
+        self.login_page.pack_forget()
+        self.dashboard.pack(fill="both", expand=True)
+        self.title("PWF Auth - License Information")
+
+    def _set_login_busy(self, busy: bool) -> None:
+        self._logging_in = busy
+        self.license_entry.configure(state="disabled" if busy else "normal")
+        self.login_button.configure(
+            state="disabled" if busy else "normal",
+            text="Verifying..." if busy else "Sign In",
+        )
+        if busy:
+            self.login_progress.place(x=42, y=341, width=416, height=4)
+            self.login_progress.start(10)
+        else:
+            self.login_progress.stop()
+            self.login_progress.place_forget()
+
+    def _set_login_message(self, message: str, *, error: bool) -> None:
+        self.login_status.configure(
+            text=message,
+            fg=COLORS["error"] if error else COLORS["muted_dark"],
+        )
+
+    def _copy_json(self) -> None:
+        value = self.raw_json.get("1.0", "end-1c")
+        if not value:
+            return
+        try:
+            self.clipboard_clear()
+            self.clipboard_append(value)
+            self.update_idletasks()
+            self.copy_button.configure(text="Copied ✓")
+            if self._copy_reset_after:
+                self.after_cancel(self._copy_reset_after)
+            self._copy_reset_after = self.after(
+                1600, lambda: self.copy_button.configure(text="Copy JSON")
+            )
+        except tk.TclError as exc:
+            messagebox.showwarning("PWF Auth", f"Could not copy the JSON: {exc}")
+
+    def _request_close(self) -> None:
+        if self._closing:
+            return
+        client = self._client
+        if client is None or not client.is_signed_in:
+            self.destroy()
+            return
+        self._closing = True
+        self.logout_button.configure(state="disabled")
+        self.session_status.configure(text="Closing session...", fg=COLORS["warning"])
+        threading.Thread(
+            target=self._logout_worker,
+            args=(client, True),
+            daemon=True,
+            name="pwfauth-close",
+        ).start()
+
+
+def main() -> None:
+    app = PwfAuthApp()
+    app.mainloop()
+
+
+if __name__ == "__main__":
+    main()
