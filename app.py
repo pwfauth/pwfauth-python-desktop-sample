@@ -1,4 +1,4 @@
-"""PWF Auth desktop client built with Tkinter.
+"""PWF Auth desktop client built with Tkinter on the official ``pwfauth`` package.
 
 The UI deliberately keeps the API response open-ended: every leaf returned by the
 server is displayed in the information table and the complete JSON remains available.
@@ -15,13 +15,16 @@ from datetime import datetime
 import tkinter as tk
 from tkinter import messagebox, ttk
 
-from pwfauth import PwfClient, PwfCryptoError, PwfError, PwfHttpError
+from pwfauth import (PwfClient, PwfCryptoError, PwfError, PwfErrorCodes, PwfHttpError,
+                     PwfResponse, PwfSecurityError)
 
 
 # Demo configuration: replace this placeholder with the 64-character secret from
 # your PWF Auth dashboard. For production applications, use an environment variable
 # instead of embedding the secret in source code.
 APP_SECRET = "YOUR_64_CHARACTER_APP_SECRET"
+
+DEFAULT_BASE_URL = "https://pwfauth.com"
 
 COLORS = {
     "page": "#0b1220",
@@ -59,6 +62,9 @@ FIELD_NAMES = {
     "app.name": "Application name",
     "app.version": "Application version",
     "app.message": "Application message",
+    "seller.type": "Sold by (type)",
+    "seller.name": "Sold by",
+    "seller.contact": "Seller contact",
     "texts": "Remote texts",
     "features": "Key features",
     "slides": "Announcement slides",
@@ -76,6 +82,17 @@ def load_app_secret() -> str | None:
     if not value or value == "YOUR_64_CHARACTER_APP_SECRET":
         return None
     return value
+
+
+def load_base_url() -> str:
+    """Optional: another server, e.g. a staging copy, from ``PWFAUTH_BASE_URL``."""
+    return os.environ.get("PWFAUTH_BASE_URL", "").strip() or DEFAULT_BASE_URL
+
+
+def describe(response: PwfResponse, fallback: str) -> str:
+    """The server's message (safe to show the user) plus its error code."""
+    message = response.message or fallback
+    return f"{message} ({response.error_code})" if response.error_code else message
 
 
 def parse_server_date(value: object) -> datetime | None:
@@ -105,6 +122,7 @@ class PwfAuthApp(tk.Tk):
 
         self._events: queue.Queue[tuple[str, object]] = queue.Queue()
         self._client: PwfClient | None = None
+        self._move_key: str | None = None  # the key "Move this license" would move
         self._logging_in = False
         self._closing = False
         self._copy_reset_after: str | None = None
@@ -176,7 +194,7 @@ class PwfAuthApp(tk.Tk):
             self.login_page,
             bg=COLORS["card"],
             width=500,
-            height=465,
+            height=515,
             highlightthickness=0,
         )
         card.place(relx=0.5, rely=0.5, anchor="center")
@@ -230,6 +248,8 @@ class PwfAuthApp(tk.Tk):
             font=("Consolas", 13),
         )
         self.license_entry.place(x=42, y=239, width=416, height=30)
+        # "Move this license" applies to the key that failed; editing it withdraws the offer.
+        self.license_key_var.trace_add("write", lambda *_: self._set_move_visible(False))
 
         self.login_button = tk.Button(
             card,
@@ -258,13 +278,34 @@ class PwfAuthApp(tk.Tk):
             wraplength=410,
         )
         self.login_status.place(x=42, y=358, width=416, height=44)
+
+        # Shown only when the key is bound to another computer (HWID_MISMATCH or
+        # DEVICE_LIMIT): a self-service move, then sign-in here.
+        # The 1-pixel blue frame around it is the button's outline.
+        self.move_frame = tk.Frame(card, bg=COLORS["blue"])
+        self.move_button = tk.Button(
+            self.move_frame,
+            text="Move this license to this PC",
+            command=self._begin_move,
+            bg=COLORS["card"],
+            activebackground="#1e293b",
+            fg=COLORS["blue_light"],
+            activeforeground=COLORS["white"],
+            disabledforeground="#64748b",
+            relief="flat",
+            bd=0,
+            highlightthickness=0,
+            cursor="hand2",
+            font=("Segoe UI", 10, "bold"),
+        )
+        self.move_button.pack(fill="both", expand=True, padx=1, pady=1)
         tk.Label(
             card,
             text="Encrypted connection  •  Key bound to this device",
             bg=COLORS["card"],
             fg="#8b97ad",
             font=("Segoe UI", 9),
-        ).place(x=42, y=412, width=416, height=22)
+        ).place(x=42, y=466, width=416, height=22)
 
     def _build_dashboard(self) -> None:
         self.dashboard = tk.Frame(self, bg=COLORS["surface"], padx=22)
@@ -463,14 +504,22 @@ class PwfAuthApp(tk.Tk):
             self._begin_login()
 
     def _begin_login(self) -> None:
-        if self._logging_in:
-            return
         license_key = self.license_key_var.get().strip().upper()
         if not license_key:
             self._set_login_message("Enter your license key first.", error=True)
             self.license_entry.focus_set()
             return
+        self._start_sign_in(license_key, move_first=False)
 
+    def _begin_move(self) -> None:
+        if self._move_key:
+            self._start_sign_in(self._move_key, move_first=True)
+
+    # Shared by Sign In and "Move this license to this PC". move_first = the user agreed
+    # to unbind the key from the computer it is bound to, then sign in here.
+    def _start_sign_in(self, license_key: str, *, move_first: bool) -> None:
+        if self._logging_in:
+            return
         app_secret = load_app_secret()
         if not app_secret:
             self._set_login_message(
@@ -480,43 +529,73 @@ class PwfAuthApp(tk.Tk):
             )
             return
 
+        self._set_move_visible(False)
         self._set_login_busy(True)
-        self._set_login_message("Verifying the key and connecting to the server...", error=False)
+        self._set_login_message(
+            "Moving the license to this computer..." if move_first
+            else "Verifying the key and connecting to the server...",
+            error=False,
+        )
         threading.Thread(
             target=self._login_worker,
-            args=(app_secret, license_key),
+            args=(app_secret, load_base_url(), license_key, move_first),
             daemon=True,
             name="pwfauth-login",
         ).start()
 
-    def _login_worker(self, app_secret: str, license_key: str) -> None:
+    def _login_worker(self, app_secret: str, base_url: str, license_key: str,
+                      move_first: bool) -> None:
         client: PwfClient | None = None
         try:
-            client = PwfClient(app_secret)
-            client.on_session_ended = self._session_ended_callback
+            client = PwfClient(app_secret, base_url=base_url)
+            session_client = client
+            client.on_session_ended = (
+                lambda code, message: self._session_ended_callback(session_client, code, message)
+            )
+
+            if move_first:
+                # Self-service move: unbinds the key from every computer it is bound to,
+                # so the login below binds it here. The developer's cooldown (12 hours by
+                # default) applies between two moves.
+                moved = client.reset_hardware_id(license_key, "Moved with the Python desktop sample")
+                if not moved.success:
+                    self._events.put(("login_failed", describe(moved, "The license could not be moved.")))
+                    return
+
             response = client.login(license_key)
             if not response.success:
-                message = response.message or "Sign-in failed."
-                if response.error_code:
-                    message += f" ({response.error_code})"
-                self._events.put(("login_failed", message))
+                if response.error_code in (PwfErrorCodes.HWID_MISMATCH, PwfErrorCodes.DEVICE_LIMIT):
+                    self._events.put(("bound_elsewhere", (license_key, response.error_code)))
+                else:
+                    self._events.put(("login_failed", describe(response, "Sign-in failed.")))
                 return
 
-            interval = response.data.get("heartbeat_interval")
-            if isinstance(interval, int) and interval > 0:
-                client.heartbeat_seconds = interval
+            # The heartbeat keeps the session alive AND enforces the kill switch. It uses
+            # the interval the server sent at sign-in.
             client.start_heartbeat()
             self._events.put(("login_succeeded", (client, response)))
             client = None
+        except PwfSecurityError:
+            self._events.put((
+                "login_failed",
+                "The reply claimed success without encryption, so it did not come from the "
+                "license server. A proxy, a hosts-file entry or a fake server is in the way.",
+            ))
         except PwfCryptoError as exc:
             self._events.put((
                 "login_failed",
-                "The encrypted response could not be verified. Check the application secret "
-                f"and the device clock.\n{exc}",
+                f"The encrypted response could not be verified. Check the application secret.\n{exc}",
             ))
         except PwfHttpError as exc:
-            status = f" (HTTP {exc.status})" if exc.status else ""
-            self._events.put(("login_failed", f"Could not reach the license server{status}.\n{exc}"))
+            if exc.status == 0:
+                # No connection at all: offline, DNS, firewall, proxy or TLS.
+                message = "Cannot reach the license server. Check your internet connection and try again."
+            elif exc.status == 401:
+                message = ("The license server refused the application secret (HTTP 401). "
+                           "Check APP_SECRET in app.py or PWFAUTH_SECRET.")
+            else:
+                message = f"The license server did not return a valid response (HTTP {exc.status}).\n{exc}"
+            self._events.put(("login_failed", message))
         except PwfError as exc:
             self._events.put(("login_failed", str(exc)))
         except Exception as exc:  # UI boundary: never let a worker silently die.
@@ -543,7 +622,10 @@ class PwfAuthApp(tk.Tk):
         warning = ""
         try:
             if client.is_signed_in:
-                client.logout()
+                # None = the server could not be reached; it ends the session on its own
+                # timeout. The key stays bound to this computer either way.
+                if client.logout() is None:
+                    warning = "Signed out locally, but the server could not be notified."
             else:
                 client.stop_heartbeat()
         except Exception as exc:
@@ -551,11 +633,14 @@ class PwfAuthApp(tk.Tk):
             warning = f"Signed out locally, but the server could not be notified: {exc}"
         self._events.put(("logout_finished", (client, close_after, warning)))
 
-    def _session_ended_callback(self, error_code: str | None, message: str | None) -> None:
-        # Called by the SDK heartbeat thread. Tk must only be touched on its main thread.
+    def _session_ended_callback(self, client: PwfClient, error_code: str | None,
+                                message: str | None) -> None:
+        # Called by the SDK heartbeat thread when the key was banned, paused, expired,
+        # reset or revoked, maintenance started, or the server stopped answering (or kept
+        # refusing this computer's clock). Tk must only be touched on its main thread.
         self._events.put((
             "session_ended",
-            (error_code or "UNKNOWN", message or "The session is no longer valid."),
+            (client, error_code or "UNKNOWN", message or "The session is no longer valid."),
         ))
 
     # ---------------------------------------------------------- event handling
@@ -573,10 +658,21 @@ class PwfAuthApp(tk.Tk):
                 elif event == "login_failed":
                     self._set_login_busy(False)
                     self._set_login_message(str(payload), error=True)
+                elif event == "bound_elsewhere":
+                    license_key, error_code = payload  # type: ignore[misc]
+                    self._set_login_busy(False)
+                    self._set_login_message(
+                        f"This key is bound to another computer ({error_code}).\n"
+                        "You can move it here — it then stops working on the other one.",
+                        error=True,
+                    )
+                    self._move_key = license_key
+                    self._set_move_visible(True)
                 elif event == "session_ended":
-                    error_code, message = payload  # type: ignore[misc]
-                    if self._client is not None:
-                        self._client.stop_heartbeat()
+                    client, error_code, message = payload  # type: ignore[misc]
+                    if client is not self._client:
+                        continue  # a session this window already left
+                    client.stop_heartbeat()
                     self._client = None
                     self._show_login()
                     self._set_login_message(
@@ -609,6 +705,8 @@ class PwfAuthApp(tk.Tk):
         app_name = app.get("name") if isinstance(app.get("name"), str) else ""
         app_version = app.get("version") if isinstance(app.get("version"), str) else ""
         app_message = app.get("message") if isinstance(app.get("message"), str) else ""
+        seller = data.get("seller") if isinstance(data.get("seller"), dict) else {}
+        seller_name = seller.get("name") if isinstance(seller.get("name"), str) else ""
         license_key = license_info.license_key if license_info else ""
 
         self.dashboard_title.configure(
@@ -617,6 +715,7 @@ class PwfAuthApp(tk.Tk):
         subtitle_parts = [part for part in (
             license_key,
             f"Version {app_version}" if app_version else "",
+            f"Sold by {seller_name}" if seller_name else "",
             app_message,
         ) if part]
         self.dashboard_subtitle.configure(text="  •  ".join(subtitle_parts))
@@ -633,7 +732,7 @@ class PwfAuthApp(tk.Tk):
 
         client = self._client
         self.session_info.configure(text=(
-            f"Device ID: {client.hardware_id}   •   Heartbeat every {client.heartbeat_seconds} seconds"
+            f"Device ID: {client.hardware_id}   •   Heartbeat every {client.heartbeat_interval:g} seconds"
             f"   •   Session ID: {client.session_id}"
         ) if client else "")
 
@@ -754,6 +853,12 @@ class PwfAuthApp(tk.Tk):
         else:
             self.login_progress.stop()
             self.login_progress.place_forget()
+
+    def _set_move_visible(self, visible: bool) -> None:
+        if visible:
+            self.move_frame.place(x=42, y=410, width=416, height=40)
+        else:
+            self.move_frame.place_forget()
 
     def _set_login_message(self, message: str, *, error: bool) -> None:
         self.login_status.configure(
