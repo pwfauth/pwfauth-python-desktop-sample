@@ -1,7 +1,9 @@
 # PWF Auth Python Desktop Sample
 
+This revision requires the new signed-response SDK (PWFAuth 1.4.0 / Python pwfauth 1.2.0 as applicable). The requirements file installs the published GitHub wheel, pinned by version and SHA-256; PyPI publication is pending. It rejects unsigned or forged replies and fixes the production endpoint.
+
 An English Tkinter desktop client for the official
-[`pwfauth` Python package](https://pypi.org/project/pwfauth/) (version 1.1.0).
+[`pwfauth` Python package](https://pypi.org/project/pwfauth/) (version 1.2.0).
 The application:
 
 - signs in with a license key;
@@ -54,14 +56,7 @@ Set your 64-character application secret near the top of `app.py`:
 APP_SECRET = "YOUR_64_CHARACTER_APP_SECRET"
 ```
 
-This is intentionally kept in the same file for the educational sample. For a
-production application, prefer the `PWFAUTH_SECRET` environment variable so the
-secret is not committed to source control. Never commit a real application secret
-or license key to the repository.
-
-Optional: to point the app at another server, such as a staging copy, set the
-`PWFAUTH_BASE_URL` environment variable. When it is empty, the app uses
-`https://pwfauth.com`.
+Configure this before distribution and never commit the real secret. The endpoint is fixed to `https://pwfauth.com`; environment overrides are ignored.
 
 ## Run
 
@@ -73,7 +68,7 @@ Or run:
 ```
 
 Upgrading from an older copy of this sample? `run.bat` brings an existing `.venv`
-up to `requirements.txt`, so `pwfauth` 1.1.0 replaces 1.0.1. Without `run.bat`:
+up to `requirements.txt`, so `pwfauth` 1.2.0 replaces 1.0.1. Without `run.bat`:
 
 ```powershell
 .\.venv\Scripts\python.exe -m pip install -r requirements.txt

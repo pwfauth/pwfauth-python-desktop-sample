@@ -72,12 +72,7 @@ FIELD_NAMES = {
 
 
 def load_app_secret() -> str | None:
-    """Return the in-code demo secret, with environment variables as an override."""
-    for variable in ("PWFAUTH_SECRET", "PWFAUTH_APP_SECRET"):
-        value = os.environ.get(variable, "").strip()
-        if value:
-            return value
-
+    """Return the app secret configured before distribution."""
     value = APP_SECRET.strip()
     if not value or value == "YOUR_64_CHARACTER_APP_SECRET":
         return None
@@ -85,8 +80,8 @@ def load_app_secret() -> str | None:
 
 
 def load_base_url() -> str:
-    """Optional: another server, e.g. a staging copy, from ``PWFAUTH_BASE_URL``."""
-    return os.environ.get("PWFAUTH_BASE_URL", "").strip() or DEFAULT_BASE_URL
+    """Return the fixed production endpoint."""
+    return DEFAULT_BASE_URL
 
 
 def describe(response: PwfResponse, fallback: str) -> str:
@@ -592,7 +587,7 @@ class PwfAuthApp(tk.Tk):
                 message = "Cannot reach the license server. Check your internet connection and try again."
             elif exc.status == 401:
                 message = ("The license server refused the application secret (HTTP 401). "
-                           "Check APP_SECRET in app.py or PWFAUTH_SECRET.")
+                           "Check APP_SECRET in app.py.")
             else:
                 message = f"The license server did not return a valid response (HTTP {exc.status}).\n{exc}"
             self._events.put(("login_failed", message))
