@@ -1,6 +1,6 @@
 # PWF Auth Python Desktop Sample
 
-This revision requires the new signed-response SDK (PWFAuth 1.4.0 / Python pwfauth 1.2.0 as applicable). The requirements file installs the published GitHub wheel, pinned by version and SHA-256; PyPI publication is pending. It rejects unsigned or forged replies and fixes the production endpoint.
+This revision requires the new signed-response SDK (PWFAuth 1.4.0 / Python pwfauth 1.2.0 as applicable). The requirements file installs the published GitHub wheel, pinned by version and SHA-256; the same version is also available on PyPI. It rejects unsigned or forged replies and fixes the production endpoint.
 
 An English Tkinter desktop client for the official
 [`pwfauth` Python package](https://pypi.org/project/pwfauth/) (version 1.2.0).
