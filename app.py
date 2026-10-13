@@ -16,7 +16,7 @@ import tkinter as tk
 from tkinter import messagebox, ttk
 
 from pwfauth import (PwfClient, PwfCryptoError, PwfError, PwfErrorCodes, PwfHttpError,
-                     PwfResponse, PwfSecurityError)
+                     PwfRefusedError, PwfResponse, PwfSecurityError)
 
 
 # Demo configuration: replace this placeholder with the 64-character secret from
@@ -68,6 +68,7 @@ FIELD_NAMES = {
     "texts": "Remote texts",
     "features": "Key features",
     "slides": "Announcement slides",
+    "vars": "User variables",
 }
 
 
@@ -88,6 +89,25 @@ def describe(response: PwfResponse, fallback: str) -> str:
     """The server's message (safe to show the user) plus its error code."""
     message = response.message or fallback
     return f"{message} ({response.error_code})" if response.error_code else message
+
+
+def touch_user_variables(client: PwfClient) -> dict:
+    """User variables (pwfauth 1.5.0): small values kept on the server for this key, such as
+    settings, progress or flags. They follow the key to another PC, and the developer sees and
+    edits them in the panel (Licences -> the key -> Variables). This sample counts how often
+    the key opened it. Runs on the worker thread; never raises, because variables are an extra.
+    """
+    try:
+        try:
+            opens = int(client.get_variable("sample_opens") or 0) + 1
+        except ValueError:  # text typed into it in the panel
+            opens = 1
+        client.set_variable("sample_opens", str(opens))
+        return {"opens": opens, "vars": client.get_variables()}
+    except PwfRefusedError as exc:
+        return {"error": f"Not available: {exc} ({exc.error_code})"}
+    except PwfError:
+        return {}
 
 
 def parse_server_date(value: object) -> datetime | None:
@@ -568,7 +588,8 @@ class PwfAuthApp(tk.Tk):
             # The heartbeat keeps the session alive AND enforces the kill switch. It uses
             # the interval the server sent at sign-in.
             client.start_heartbeat()
-            self._events.put(("login_succeeded", (client, response)))
+            variables = touch_user_variables(client)
+            self._events.put(("login_succeeded", (client, response, variables)))
             client = None
         except PwfSecurityError:
             self._events.put((
@@ -645,9 +666,9 @@ class PwfAuthApp(tk.Tk):
             while True:
                 event, payload = self._events.get_nowait()
                 if event == "login_succeeded":
-                    client, response = payload  # type: ignore[misc]
+                    client, response, variables = payload  # type: ignore[misc]
                     self._client = client
-                    self._populate_dashboard(response)
+                    self._populate_dashboard(response, variables)
                     self._set_login_busy(False)
                     self._show_dashboard()
                 elif event == "login_failed":
@@ -692,7 +713,7 @@ class PwfAuthApp(tk.Tk):
 
     # ---------------------------------------------------------- data display
 
-    def _populate_dashboard(self, response: object) -> None:
+    def _populate_dashboard(self, response: object, variables: dict | None = None) -> None:
         data = response.data  # PwfResponse; kept untyped to support future SDK growth.
         license_info = response.license
         app = data.get("app") if isinstance(data.get("app"), dict) else {}
@@ -707,11 +728,14 @@ class PwfAuthApp(tk.Tk):
         self.dashboard_title.configure(
             text=f"{app_name} — License Information" if app_name else "License Information"
         )
+        variables = variables or {}
+        opens = variables.get("opens")
         subtitle_parts = [part for part in (
             license_key,
             f"Version {app_version}" if app_version else "",
             f"Sold by {seller_name}" if seller_name else "",
             app_message,
+            f"Opened {opens} time{'' if opens == 1 else 's'} with this key" if opens else "",
         ) if part]
         self.dashboard_subtitle.configure(text="  •  ".join(subtitle_parts))
 
@@ -735,9 +759,15 @@ class PwfAuthApp(tk.Tk):
             self.details_tree.delete(item)
         rows: list[tuple[str, object]] = []
         self._flatten_json(data, "", rows)
+        # the key's user variables, after the login reply's fields
+        rows.extend((f"vars.{name}", value) for name, value in sorted((variables.get("vars") or {}).items()))
+        if variables.get("error"):
+            rows.append(("vars", variables["error"]))
         for index, (path, value) in enumerate(rows):
             normalized = normalize_array_path(path)
             display_name = FIELD_NAMES.get(path) or FIELD_NAMES.get(normalized)
+            if not display_name and normalized.startswith("vars."):
+                display_name = f"Variable: {normalized[5:]}"
             if not display_name:
                 display_name = normalized.rsplit(".", 1)[-1] if normalized else "Value"
             self.details_tree.insert(

@@ -1,15 +1,16 @@
 # PWF Auth Python Desktop Sample
 
-This revision requires the new signed-response SDK (PWFAuth 1.4.0 / Python pwfauth 1.2.0 as applicable). The requirements file installs the published GitHub wheel, pinned by version and SHA-256; the same version is also available on PyPI. It rejects unsigned or forged replies and fixes the production endpoint.
+This revision uses `pwfauth` **1.5.0**. The requirements file installs the PyPI wheel, pinned by version and SHA-256. Versions before 1.3.0 cannot talk to the current server (it signs its replies with a new key), so update older copies.
 
 An English Tkinter desktop client for the official
-[`pwfauth` Python package](https://pypi.org/project/pwfauth/) (version 1.2.0).
+[`pwfauth` Python package](https://pypi.org/project/pwfauth/) (version 1.5.0).
 The application:
 
 - signs in with a license key;
 - keeps the session alive with the background heartbeat;
 - signs out when the server ends the session;
-- shows the complete login response in a dashboard.
+- shows the complete login response in a dashboard;
+- keeps a value on the server for the key (a user variable).
 
 ![The dashboard after signing in](docs/dashboard.png)
 
@@ -34,6 +35,13 @@ The application:
 
   ![Move this license to this PC](docs/move-license.png)
 
+- **User variables.** After sign-in the app reads `sample_opens`, adds one and
+  saves it with `get_variable()` / `set_variable()`, shows "Opened N times with
+  this key" under the title, and lists every variable of the key
+  (`get_variables()`) in the details table. Open the key in your panel
+  (**Licences → the key → Variables**): the count is there, and a value you
+  change there is what the app reads next time. Variables follow the key to a
+  new PC.
 - **Clear errors.** The app shows a plain message when:
   - there is no internet connection;
   - the server refuses the application secret (HTTP 401);
@@ -68,7 +76,7 @@ Or run:
 ```
 
 Upgrading from an older copy of this sample? `run.bat` brings an existing `.venv`
-up to `requirements.txt`, so `pwfauth` 1.2.0 replaces 1.0.1. Without `run.bat`:
+up to `requirements.txt`, so `pwfauth` 1.5.0 replaces the older version. Without `run.bat`:
 
 ```powershell
 .\.venv\Scripts\python.exe -m pip install -r requirements.txt
